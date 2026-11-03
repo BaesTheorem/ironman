@@ -79,8 +79,10 @@ never stored, so the phone and the Mac can both rewrite the file.
 | Crafting | Small thing 50, real project 200, ambitious 600, masterwork 1500. |
 | Cooking | Simple 30, everyday 70, involved 120, exotic 210, feast 300. |
 
-Sleep nights and steps come from Fitbit: `bin/hitpoints-verify` reads the
-sleep goal, the last 14 nights and the daily step series, and writes them
+Sleep nights and steps come from Fitbit through the Google Health API v4 (the
+Fitbit Web API shut down on 2026-10-30): `bin/hitpoints-verify` reads the last
+14 nights and the daily step series against a 450-minute goal (`--goal`; Google
+has no sleep-goal endpoint), and writes them
 into `skills.nights` and `skills.steps` (nights over anything claimed in
 the app; zero-step days skipped). The harness's quest watcher runs it every half hour.
 A level gained on either side raises the level-up banner with that
@@ -222,8 +224,10 @@ so they arrive with the screen locked, and every boundary also fires a local
 notification. Fitbit's auto-detect is enough to verify a session; starting a
 Run on the watch adds GPS distance and full active-minute credit.
 
-The Mac verifies. `bin/quest-verify` pulls Fitbit's activity list (token
-from `$FITBIT_TOKEN_FILE`, never refreshed here), matches each attempt to
+The Mac verifies. `bin/quest-verify` pulls Fitbit exercises from the Google
+Health API (token from the harness's `fitbit-mcp/bin/google-health-token`,
+never refreshed here), converts them to the Fitbit activity shape (active
+minutes come from heart-rate zone time), matches each attempt to
 the activity that overlaps it most, and writes a `verification` block into
 the attempt. Bikes never match. It is idempotent, so run it whenever. The
 rules are in `lib/quest.py` and mirrored in

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Write Fitbit's sleep nights and daily steps into the log for Hitpoints.
 
-Pulls the sleep goal and the last N nights from Fitbit, marks each night
+Pulls the last N nights from the Google Health API (Fitbit data), marks each night
 goal-met or not, and merges them over any night the phone claimed; pulls
 the daily step series and merges it too. Emits a ``level_up`` event when
 Hitpoints crosses a level. Idempotent.
@@ -11,8 +11,9 @@ Hitpoints crosses a level. Idempotent.
     hitpoints-verify --dry-run
     hitpoints-verify --goal 450     # override the goal in minutes
 
-Token handling is the same as quest-verify: read-only, never refreshed,
-exit 2 when expired.
+The access token comes from the harness fitbit-mcp/bin/google-health-token;
+exit 2 when the token or the API is not usable. The Fitbit Web API this used
+to read shut down on 2026-10-30.
 """
 from __future__ import annotations
 
@@ -20,8 +21,6 @@ import argparse
 import json
 import os
 import sys
-import urllib.error
-import urllib.request
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -29,59 +28,32 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent / "lib"))
 import quest as q
 import skills as sk
+import google_health as gh
 
-DEFAULT_TOKEN = Path.home() / "Documents/Exobrain harness/fitbit-mcp/.fitbit-token.json"
-API = "https://api.fitbit.com/1.2/user/-"
-API_V1 = "https://api.fitbit.com/1/user/-"
 DEFAULT_GOAL_MINUTES = 450
 
 
-def load_token(path: Path) -> str:
-    try:
-        data = json.loads(path.read_text())
-    except (OSError, json.JSONDecodeError) as e:
-        sys.exit(f"cannot read token file {path}: {e}")
-    token = data.get("access_token") or data.get("accessToken")
-    if not token:
-        sys.exit(f"no access_token in {path}")
-    return token
-
-
-def get(token: str, path: str, base: str = API) -> dict:
-    req = urllib.request.Request(f"{base}{path}", headers={"Authorization": f"Bearer {token}"})
-    try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            return json.load(resp)
-    except urllib.error.HTTPError as e:
-        if e.code == 401:
-            sys.exit(2)
-        sys.exit(f"Fitbit {path}: HTTP {e.code}")
-
-
-def sleep_goal_minutes(token: str) -> int:
-    try:
-        return int(get(token, "/sleep/goal.json")["goal"]["minDuration"])
-    except (KeyError, ValueError, TypeError):
-        return DEFAULT_GOAL_MINUTES
-
-
-def nights(token: str, days: int, goal: int) -> list[dict]:
+def nights(tok: str, days: int, goal: int) -> list[dict]:
+    """Main sleep per wake-up date. Google's minutesAsleep runs 9 to 34 min
+    longer than Fitbit's did for the same nights (measured 2026-11-02)."""
     end = datetime.now(timezone.utc).astimezone().date()
     start = end - timedelta(days=days)
-    data = get(token, f"/sleep/date/{start:%Y-%m-%d}/{end:%Y-%m-%d}.json")
+    flt = f'sleep.interval.civil_end_time >= "{start}" AND sleep.interval.civil_end_time < "{end + timedelta(days=1)}"'
     by_date: dict[str, int] = {}
-    for s in data.get("sleep", []):
-        if not s.get("isMainSleep", True):
+    for p in gh.list_points(tok, "sleep", flt, page_size=25):
+        s = p["sleep"]
+        if not s.get("metadata", {}).get("mainSleep", True):
             continue
-        by_date[s["dateOfSleep"]] = max(by_date.get(s["dateOfSleep"], 0), int(s.get("minutesAsleep", 0)))
+        d = gh.local_iso(s["interval"]["endTime"], s["interval"].get("endUtcOffset"))
+        by_date[d] = max(by_date.get(d, 0), int(s.get("summary", {}).get("minutesAsleep", 0)))
     return [{"date": d, "minutes": m, "goalMet": m >= goal} for d, m in sorted(by_date.items())]
 
 
-def step_days(token: str, days: int) -> list[dict]:
+def step_days(tok: str, days: int) -> list[dict]:
     end = datetime.now(timezone.utc).astimezone().date()
     start = end - timedelta(days=days)
-    data = get(token, f"/activities/steps/date/{start:%Y-%m-%d}/{end:%Y-%m-%d}.json", base=API_V1)
-    return [{"date": r["dateTime"], "steps": int(r["value"])} for r in data.get("activities-steps", [])]
+    return [{"date": gh.civil_date(r["civilStartTime"]["date"]), "steps": int(r.get("steps", {}).get("countSum", 0))}
+            for r in sorted(gh.daily_rollup(tok, "steps", start, end), key=lambda r: gh.civil_date(r["civilStartTime"]["date"]))]
 
 
 def locate(explicit: str | None) -> Path:
@@ -105,17 +77,16 @@ def locate(explicit: str | None) -> Path:
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--file")
-    ap.add_argument("--token-file", default=os.environ.get("FITBIT_TOKEN_FILE", str(DEFAULT_TOKEN)))
     ap.add_argument("--days", type=int, default=14)
-    ap.add_argument("--goal", type=int, help="sleep goal in minutes (default: Fitbit's)")
+    ap.add_argument("--goal", type=int, default=DEFAULT_GOAL_MINUTES, help="sleep goal in minutes (default 450; Google Health has no sleep-goal endpoint)")
     ap.add_argument("--json", action="store_true")
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()
 
     path = locate(args.file)
     data = json.loads(path.read_text())
-    token = load_token(Path(args.token_file))
-    goal = args.goal or sleep_goal_minutes(token)
+    token = gh.token()
+    goal = args.goal
     verified = nights(token, args.days, goal)
 
     before_level = sk.levels(data)["hitpoints"]

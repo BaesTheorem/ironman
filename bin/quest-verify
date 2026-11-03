@@ -12,10 +12,10 @@ next foreground. Idempotent: run it as often as you like.
     quest-verify --json          # events as JSON (for a watcher)
     quest-verify --dry-run       # match, print, write nothing
 
-The Fitbit access token is read from ``--token-file`` / ``$FITBIT_TOKEN_FILE``
-(default: the harness's ``fitbit-mcp/.fitbit-token.json``). This never
-refreshes the token: refresh tokens are single use and the MCP server owns
-them. An expired token is exit 2, not a refresh.
+Fitbit exercises come from the Google Health API v4 (the Fitbit Web API shut
+down on 2026-10-30), converted to the Fitbit activity shape quest.py matches
+on. The access token comes from the harness fitbit-mcp/bin/google-health-token.
+A token or API failure is exit 2.
 """
 from __future__ import annotations
 
@@ -23,9 +23,6 @@ import argparse
 import json
 import os
 import sys
-import urllib.error
-import urllib.parse
-import urllib.request
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -33,42 +30,47 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent / "lib"))
 sys.path.insert(0, str(HERE))
 import quest as q  # noqa: E402
+import google_health as gh  # noqa: E402
 
-DEFAULT_TOKEN = Path.home() / "Documents/Exobrain harness/fitbit-mcp/.fitbit-token.json"
-API = "https://api.fitbit.com/1/user/-"
-
-
-def load_token(path: Path) -> str:
-    try:
-        tok = json.loads(path.read_text())
-    except FileNotFoundError:
-        sys.exit(f"no Fitbit token at {path}; set FITBIT_TOKEN_FILE or --token-file")
-    exp = tok.get("expires_at")
-    if exp and q.parse_ts(exp) <= datetime.now(timezone.utc):
-        print(f"Fitbit token expired at {exp}; the fitbit-token job or any MCP use refreshes it", file=sys.stderr)
-        sys.exit(2)
-    return tok["access_token"]
+def _activity_name(ex: dict) -> str:
+    """displayName plus the type in words quest.py's EXCLUDED / RUNNING_WORDS
+    match on ('BIKING' must read as 'bike', 'RUNNING' as 'run')."""
+    words = ex.get("exerciseType", "").lower().replace("_", " ").replace("biking", "bike").replace("cycling", "cycle")
+    words = words.replace("running", "run").replace("jogging", "jog")
+    name = ex.get("displayName") or ""
+    return f"{name} ({words})" if name else words
 
 
-def fetch_activities(token: str, after: datetime) -> list[dict]:
-    out: list[dict] = []
-    url = f"{API}/activities/list.json?" + urllib.parse.urlencode(
-        {"afterDate": after.strftime("%Y-%m-%d"), "sort": "asc", "limit": 100, "offset": 0})
-    while url:
-        req = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"})
-        try:
-            with urllib.request.urlopen(req, timeout=30) as resp:
-                page = json.load(resp)
-        except urllib.error.HTTPError as e:
-            body = e.read().decode(errors="replace")[:300]
-            print(f"Fitbit {e.code}: {body}", file=sys.stderr)
-            sys.exit(2)
-        except (urllib.error.URLError, TimeoutError) as e:
-            print(f"Fitbit unreachable: {e}", file=sys.stderr)
-            sys.exit(2)
-        out.extend(page.get("activities", []))
-        url = page.get("pagination", {}).get("next") or None
-    return out
+def to_fitbit_activity(p: dict) -> dict:
+    """A Google exercise data point in the Fitbit activity shape quest.py reads.
+    activityLevel comes from heart-rate zone time (Fitbit used METs):
+    'very' = vigorous + peak minutes, 'fairly' = moderate minutes."""
+    ex = p["exercise"]
+    start = datetime.fromisoformat(ex["interval"]["startTime"].replace("Z", "+00:00"))
+    end = datetime.fromisoformat(ex["interval"]["endTime"].replace("Z", "+00:00"))
+    m = ex.get("metricsSummary", {})
+    z = m.get("heartRateZoneDurations", {})
+    act = {
+        "logId": int(p["name"].rsplit("/", 1)[-1]),
+        "activityName": _activity_name(ex),
+        "startTime": ex["interval"]["startTime"],
+        "duration": int((end - start).total_seconds() * 1000),
+        "distance": float(m.get("distanceMillimeters", 0) or 0) / 1e6,
+        "activityLevel": [
+            {"name": "very", "minutes": int((gh.seconds(z.get("vigorousTime")) + gh.seconds(z.get("peakTime"))) // 60)},
+            {"name": "fairly", "minutes": int(gh.seconds(z.get("moderateTime")) // 60)},
+        ],
+    }
+    if m.get("averageHeartRateBeatsPerMinute") is not None:
+        act["averageHeartRate"] = int(m["averageHeartRateBeatsPerMinute"])
+    return act
+
+
+def fetch_activities(after: datetime) -> list[dict]:
+    tok = gh.token()
+    local = after.astimezone().strftime("%Y-%m-%dT%H:%M:%S")
+    points = gh.list_points(tok, "exercise", f'exercise.interval.civil_start_time >= "{local}"', page_size=25)
+    return sorted((to_fitbit_activity(p) for p in points), key=lambda a: a["startTime"])
 
 
 def describe(ev: dict) -> str:
@@ -88,7 +90,6 @@ def describe(ev: dict) -> str:
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--file", help="exercise-log.json (default: the app's sync folder)")
-    ap.add_argument("--token-file", default=os.environ.get("FITBIT_TOKEN_FILE", str(DEFAULT_TOKEN)))
     ap.add_argument("--days", type=int, default=14, help="how far back to pull Fitbit activities")
     ap.add_argument("--json", action="store_true", help="print the events as JSON")
     ap.add_argument("--dry-run", action="store_true")
@@ -103,9 +104,8 @@ def main() -> None:
     path = reader.locate(args.file)
     data = reader.load(path)
 
-    token = load_token(Path(args.token_file).expanduser())
     after = datetime.now(timezone.utc) - timedelta(days=args.days)
-    activities = fetch_activities(token, after)
+    activities = fetch_activities(after)
 
     before = json.dumps(data, sort_keys=True)
     data, events = q.apply(data, activities)
